@@ -230,7 +230,25 @@ export const ChatInterface: React.FC<ChatInterfaceProps> = ({
                     <div className="whitespace-pre-wrap font-sans">{msg.content}</div>
                   ) : (
                     <div className="prose prose-stone prose-sm max-w-none prose-p:leading-relaxed prose-headings:font-serif">
-                      <ReactMarkdown>{msg.content}</ReactMarkdown>
+                      <ReactMarkdown
+                        components={{
+                          a: ({ href, children }) => {
+                            const isSafe = href && /^(https?:|mailto:)/i.test(href);
+                            return (
+                              <a
+                                href={isSafe ? href : '#'}
+                                target="_blank"
+                                rel="noopener noreferrer"
+                                className="text-amber-800 underline hover:text-amber-950 font-medium"
+                              >
+                                {children}
+                              </a>
+                            );
+                          },
+                        }}
+                      >
+                        {msg.content}
+                      </ReactMarkdown>
                     </div>
                   )}
 

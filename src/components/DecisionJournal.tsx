@@ -1,11 +1,12 @@
 import React, { useState } from 'react';
 import { DecisionItem, DecisionReview, UserSession } from '../types';
-import { coachDecision } from '../lib/geminiApi';
+import { coachDecision, detectDecisionsFromJournal } from '../lib/geminiApi';
 import {
   saveDecision,
   updateDecision,
   recordDecisionReview,
   deleteDecision,
+  batchSaveDecisions,
 } from '../lib/firestoreService';
 import {
   Scale,
@@ -22,6 +23,8 @@ import {
   ShieldCheck,
   ChevronRight,
   RotateCcw,
+  Edit2,
+  ExternalLink,
 } from 'lucide-react';
 
 interface DecisionJournalProps {
@@ -39,12 +42,23 @@ export const DecisionJournal: React.FC<DecisionJournalProps> = ({
   onDecisionsUpdated,
   onNavigateToSession,
 }) => {
+  const [filter, setFilter] = useState<'all' | 'confirmed' | 'drafts' | 'review'>('all');
   const [isCreateModalOpen, setIsCreateModalOpen] = useState(false);
   const [isReviewModalOpen, setIsReviewModalOpen] = useState(false);
   const [selectedDecisionForReview, setSelectedDecisionForReview] = useState<DecisionItem | null>(null);
   const [isAnalyzingCoach, setIsAnalyzingCoach] = useState(false);
+  const [isScanning, setIsScanning] = useState(false);
   const [coachFeedback, setCoachFeedback] = useState<any | null>(null);
   const [errorMessage, setErrorMessage] = useState<string | null>(null);
+
+  // Edit Decision Modal State
+  const [editingDecision, setEditingDecision] = useState<DecisionItem | null>(null);
+  const [editTitle, setEditTitle] = useState('');
+  const [editOptions, setEditOptions] = useState<string[]>(['']);
+  const [editReasoning, setEditReasoning] = useState('');
+  const [editAssumptions, setEditAssumptions] = useState<string[]>(['']);
+  const [editChoice, setEditChoice] = useState('');
+  const [editConfidenceScore, setEditConfidenceScore] = useState<number>(80);
 
   // New Decision Form State
   const [title, setTitle] = useState('');
@@ -60,6 +74,118 @@ export const DecisionJournal: React.FC<DecisionJournalProps> = ({
   const [workedOut, setWorkedOut] = useState<'yes' | 'partial' | 'no'>('yes');
   const [assumptionsValidated, setAssumptionsValidated] = useState(true);
   const [lessonsLearned, setLessonsLearned] = useState('');
+
+  // Counts & Filter logic
+  const confirmedCount = decisions.filter((d) => d.confirmed !== false).length;
+  const draftCount = decisions.filter((d) => d.isAIGenerated && !d.confirmed).length;
+  const readyReviewCount = decisions.filter(
+    (d) => d.reviewDate && new Date(d.reviewDate).getTime() <= Date.now() && !d.reviewOutcome
+  ).length;
+
+  const filteredDecisions = decisions.filter((d) => {
+    if (filter === 'confirmed') return d.confirmed !== false;
+    if (filter === 'drafts') return d.isAIGenerated && !d.confirmed;
+    if (filter === 'review') {
+      return d.reviewDate && new Date(d.reviewDate).getTime() <= Date.now() && !d.reviewOutcome;
+    }
+    return true;
+  });
+
+  // Scan journal for decisions
+  const handleScanDecisions = async () => {
+    if (sessions.length === 0) {
+      setErrorMessage('Write at least one journal entry first before scanning for decisions.');
+      return;
+    }
+
+    setIsScanning(true);
+    setErrorMessage(null);
+
+    const payload = sessions.slice(0, 10).map((s) => ({
+      sessionId: s.id,
+      sessionTitle: s.title,
+      text: s.summary || s.title,
+    }));
+
+    try {
+      const response = await detectDecisionsFromJournal(payload);
+      if (!response.decisions || response.decisions.length === 0) {
+        setErrorMessage('No unrecorded decision crossroads detected in recent journal entries.');
+        return;
+      }
+
+      const existingTitles = new Set(decisions.map((d) => d.title.toLowerCase().trim()));
+      const uniqueNew = response.decisions.filter(
+        (d) => !existingTitles.has(d.title.toLowerCase().trim())
+      );
+
+      if (uniqueNew.length === 0) {
+        setErrorMessage('All detected decisions have already been logged in your Decision Journal.');
+        return;
+      }
+
+      const saved = await batchSaveDecisions(userId, uniqueNew);
+      onDecisionsUpdated([...saved, ...decisions]);
+    } catch (err: any) {
+      console.error('Error scanning decisions:', err);
+      setErrorMessage(err?.message || 'Failed to detect decisions from journal.');
+    } finally {
+      setIsScanning(false);
+    }
+  };
+
+  // Confirm an AI-generated decision
+  const handleConfirmDecision = async (id: string) => {
+    try {
+      await updateDecision(userId, id, { confirmed: true });
+      const updated = decisions.map((d) =>
+        d.id === id ? { ...d, confirmed: true, updatedAt: Date.now() } : d
+      );
+      onDecisionsUpdated(updated);
+    } catch (err: any) {
+      console.error('Failed to confirm decision:', err);
+      setErrorMessage('Failed to confirm decision.');
+    }
+  };
+
+  // Open Edit Decision Modal
+  const openEditModal = (decision: DecisionItem) => {
+    setEditingDecision(decision);
+    setEditTitle(decision.title);
+    setEditOptions(decision.options.length > 0 ? [...decision.options] : ['']);
+    setEditReasoning(decision.reasoning || '');
+    setEditAssumptions(decision.assumptions.length > 0 ? [...decision.assumptions] : ['']);
+    setEditChoice(decision.choice || '');
+    setEditConfidenceScore(decision.confidenceScore ?? 80);
+  };
+
+  // Save Decision Edits
+  const handleSaveDecisionEdits = async (e: React.FormEvent) => {
+    e.preventDefault();
+    if (!editingDecision || !editTitle.trim()) return;
+
+    try {
+      const updates = {
+        title: editTitle.trim(),
+        options: editOptions.filter((o) => o.trim()),
+        reasoning: editReasoning.trim(),
+        assumptions: editAssumptions.filter((a) => a.trim()),
+        choice: editChoice.trim(),
+        confidenceScore: editConfidenceScore,
+        confirmed: true, // Editing confirms user ownership
+      };
+
+      await updateDecision(userId, editingDecision.id, updates);
+      const updated = decisions.map((d) =>
+        d.id === editingDecision.id ? { ...d, ...updates, updatedAt: Date.now() } : d
+      );
+      onDecisionsUpdated(updated);
+      setEditingDecision(null);
+    } catch (err: any) {
+      console.error('Failed to save decision edits:', err);
+      setErrorMessage('Failed to save decision edits.');
+    }
+  };
 
   // Add/Remove Option inputs
   const handleAddOption = () => setOptions([...options, '']);
@@ -213,15 +339,82 @@ export const DecisionJournal: React.FC<DecisionJournalProps> = ({
             </p>
           </div>
 
+          <div className="flex items-center gap-2 flex-wrap">
+            <button
+              onClick={handleScanDecisions}
+              disabled={isScanning}
+              className="flex items-center gap-2 rounded-xl bg-stone-100 hover:bg-stone-200 border border-stone-300 px-3.5 py-2 text-xs font-semibold text-stone-800 transition-colors shrink-0"
+            >
+              {isScanning ? (
+                <>
+                  <Loader2 className="h-4 w-4 animate-spin text-stone-600" />
+                  <span>Scanning Journal...</span>
+                </>
+              ) : (
+                <>
+                  <Sparkles className="h-4 w-4 text-indigo-600" />
+                  <span>Detect from Journal</span>
+                </>
+              )}
+            </button>
+
+            <button
+              onClick={() => {
+                resetForm();
+                setIsCreateModalOpen(true);
+              }}
+              className="flex items-center gap-1.5 rounded-xl bg-stone-900 hover:bg-stone-800 px-4 py-2 text-xs font-semibold text-white shadow-xs transition-colors shrink-0"
+            >
+              <Plus className="h-4 w-4" />
+              <span>Record New Decision</span>
+            </button>
+          </div>
+        </div>
+
+        {/* Filter Pills */}
+        <div className="mx-auto max-w-5xl mt-5 pt-4 border-t border-stone-100 flex items-center gap-2 flex-wrap">
           <button
-            onClick={() => {
-              resetForm();
-              setIsCreateModalOpen(true);
-            }}
-            className="flex items-center gap-1.5 rounded-xl bg-stone-900 hover:bg-stone-800 px-4 py-2.5 text-xs font-semibold text-white shadow-xs transition-colors shrink-0"
+            onClick={() => setFilter('all')}
+            className={`rounded-lg px-3 py-1.5 text-xs font-medium transition-colors ${
+              filter === 'all'
+                ? 'bg-stone-900 text-white'
+                : 'bg-stone-100 text-stone-600 hover:bg-stone-200'
+            }`}
           >
-            <Plus className="h-4 w-4" />
-            <span>Record New Decision</span>
+            All ({decisions.length})
+          </button>
+          <button
+            onClick={() => setFilter('drafts')}
+            className={`rounded-lg px-3 py-1.5 text-xs font-medium transition-colors flex items-center gap-1.5 ${
+              filter === 'drafts'
+                ? 'bg-amber-600 text-white'
+                : 'bg-amber-50 text-amber-800 hover:bg-amber-100'
+            }`}
+          >
+            <Sparkles className="h-3.5 w-3.5" />
+            AI Drafts ({draftCount})
+          </button>
+          <button
+            onClick={() => setFilter('confirmed')}
+            className={`rounded-lg px-3 py-1.5 text-xs font-medium transition-colors flex items-center gap-1.5 ${
+              filter === 'confirmed'
+                ? 'bg-emerald-700 text-white'
+                : 'bg-emerald-50 text-emerald-800 hover:bg-emerald-100'
+            }`}
+          >
+            <CheckCircle2 className="h-3.5 w-3.5" />
+            Confirmed ({confirmedCount})
+          </button>
+          <button
+            onClick={() => setFilter('review')}
+            className={`rounded-lg px-3 py-1.5 text-xs font-medium transition-colors flex items-center gap-1.5 ${
+              filter === 'review'
+                ? 'bg-indigo-700 text-white'
+                : 'bg-indigo-50 text-indigo-800 hover:bg-indigo-100'
+            }`}
+          >
+            <Clock className="h-3.5 w-3.5" />
+            Ready for Review ({readyReviewCount})
           </button>
         </div>
       </div>
@@ -235,44 +428,94 @@ export const DecisionJournal: React.FC<DecisionJournalProps> = ({
           </div>
         )}
 
-        {decisions.length === 0 ? (
+        {filteredDecisions.length === 0 ? (
           <div className="rounded-2xl border border-stone-200 bg-white p-12 text-center space-y-4 shadow-xs">
             <Scale className="h-12 w-12 text-stone-300 mx-auto" />
             <h3 className="font-serif text-lg font-bold text-stone-900">
-              No Decisions Logged Yet
+              No Decisions Found
             </h3>
             <p className="text-xs text-stone-500 max-w-sm mx-auto">
-              Making a career shift, investment, or personal crossroad? Document your options, assumptions, and confidence score to calibrate judgment over time.
+              {filter === 'drafts'
+                ? 'No unconfirmed AI drafts. Click "Detect from Journal" to discover decision crossroads from your entries.'
+                : 'Document your options, assumptions, and confidence score to calibrate judgment over time.'}
             </p>
-            <button
-              onClick={() => {
-                resetForm();
-                setIsCreateModalOpen(true);
-              }}
-              className="rounded-xl bg-stone-900 px-5 py-2.5 text-xs font-semibold text-white hover:bg-stone-800"
-            >
-              Log First Decision
-            </button>
+            {filter === 'all' && (
+              <button
+                onClick={() => {
+                  resetForm();
+                  setIsCreateModalOpen(true);
+                }}
+                className="rounded-xl bg-stone-900 px-5 py-2.5 text-xs font-semibold text-white hover:bg-stone-800"
+              >
+                Log First Decision
+              </button>
+            )}
           </div>
         ) : (
           <div className="space-y-4">
-            {decisions.map((decision) => {
+            {filteredDecisions.map((decision) => {
               const isReviewed = Boolean(decision.reviewOutcome);
               const isPastReviewDate =
                 decision.reviewDate && new Date(decision.reviewDate).getTime() <= Date.now();
+              const isUnconfirmedDraft = decision.isAIGenerated && !decision.confirmed;
 
               return (
                 <div
                   key={decision.id}
-                  className="rounded-2xl border border-amber-900/10 bg-white/80 backdrop-blur-md p-6 shadow-sm space-y-4 transition-all"
+                  className={`rounded-2xl border p-6 shadow-sm space-y-4 transition-all ${
+                    isUnconfirmedDraft
+                      ? 'border-amber-400/70 bg-amber-50/30 backdrop-blur-md ring-1 ring-amber-300/40'
+                      : 'border-amber-900/10 bg-white/80 backdrop-blur-md'
+                  }`}
                 >
+                  {/* AI Draft Unconfirmed Notice */}
+                  {isUnconfirmedDraft && (
+                    <div className="rounded-xl bg-amber-50 border border-amber-200/80 p-3.5 flex flex-col sm:flex-row sm:items-center justify-between gap-3 text-xs">
+                      <div className="flex items-start gap-2.5">
+                        <Sparkles className="h-4 w-4 text-amber-600 shrink-0 mt-0.5" />
+                        <div>
+                          <span className="font-bold text-amber-950">AI-Extracted Decision · Draft (Unconfirmed)</span>
+                          <p className="text-[11px] text-amber-800/90 mt-0.5">
+                            Identified by Gemini from your private reflections. AI drafts are not factual user decisions until you review and confirm them.
+                          </p>
+                        </div>
+                      </div>
+                      <div className="flex items-center gap-2 shrink-0">
+                        <button
+                          onClick={() => handleConfirmDecision(decision.id)}
+                          className="rounded-lg bg-emerald-600 hover:bg-emerald-700 text-white px-3 py-1.5 text-xs font-semibold flex items-center gap-1 shadow-xs transition-colors"
+                        >
+                          <CheckCircle2 className="h-3.5 w-3.5" />
+                          <span>Confirm Decision</span>
+                        </button>
+                        <button
+                          onClick={() => openEditModal(decision)}
+                          className="rounded-lg bg-white hover:bg-stone-50 text-stone-800 border border-stone-300 px-3 py-1.5 text-xs font-medium flex items-center gap-1 transition-colors"
+                        >
+                          <Edit2 className="h-3 w-3 text-stone-500" />
+                          <span>Edit</span>
+                        </button>
+                        <button
+                          onClick={() => handleDeleteDecision(decision.id)}
+                          className="rounded-lg bg-stone-100 hover:bg-rose-50 hover:text-rose-700 text-stone-600 px-2.5 py-1.5 text-xs font-medium transition-colors"
+                        >
+                          Dismiss
+                        </button>
+                      </div>
+                    </div>
+                  )}
+
                   <div className="flex flex-col sm:flex-row sm:items-start justify-between gap-3 border-b border-stone-100 pb-3">
                     <div>
-                      <div className="flex items-center gap-2">
+                      <div className="flex items-center gap-2 flex-wrap">
                         <h3 className="font-serif text-lg font-bold text-stone-900">
                           {decision.title}
                         </h3>
-                        {isReviewed ? (
+                        {isUnconfirmedDraft ? (
+                          <span className="rounded-full bg-amber-100 px-2.5 py-0.5 text-[10px] font-semibold text-amber-900 border border-amber-200">
+                            AI Draft
+                          </span>
+                        ) : isReviewed ? (
                           <span
                             className={`rounded-full px-2.5 py-0.5 text-[10px] font-semibold ${
                               decision.reviewOutcome?.workedOut === 'yes'
@@ -291,8 +534,19 @@ export const DecisionJournal: React.FC<DecisionJournalProps> = ({
                           </span>
                         ) : (
                           <span className="rounded-full bg-stone-100 px-2.5 py-0.5 text-[10px] font-medium text-stone-600">
-                            Pending Review
+                            Confirmed · Pending Review
                           </span>
+                        )}
+
+                        {decision.sessionId && (
+                          <button
+                            onClick={() => onNavigateToSession(decision.sessionId!)}
+                            className="inline-flex items-center gap-1 rounded-md bg-stone-50 px-2 py-0.5 text-[10px] text-stone-500 hover:text-stone-900 border border-stone-200"
+                            title="Open original journal session"
+                          >
+                            <span>from entry</span>
+                            <ExternalLink className="h-2.5 w-2.5" />
+                          </button>
                         )}
                       </div>
 
@@ -306,7 +560,15 @@ export const DecisionJournal: React.FC<DecisionJournalProps> = ({
                       </div>
                     </div>
 
-                    <div className="flex items-center gap-2">
+                    <div className="flex items-center gap-2 shrink-0">
+                      <button
+                        onClick={() => openEditModal(decision)}
+                        className="p-1.5 text-stone-400 hover:text-stone-800 transition-colors"
+                        title="Edit decision"
+                      >
+                        <Edit2 className="h-4 w-4" />
+                      </button>
+
                       <button
                         onClick={() => openReviewModal(decision)}
                         className={`rounded-xl px-3 py-1.5 text-xs font-semibold flex items-center gap-1.5 transition-colors ${
@@ -790,6 +1052,117 @@ export const DecisionJournal: React.FC<DecisionJournalProps> = ({
                   className="rounded-xl bg-stone-900 px-6 py-2 font-semibold text-white hover:bg-stone-800 shadow-xs"
                 >
                   Record Review
+                </button>
+              </div>
+            </form>
+          </div>
+        </div>
+      )}
+
+      {/* Edit Decision Modal */}
+      {editingDecision && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/40 backdrop-blur-xs p-4 overflow-y-auto">
+          <div className="w-full max-w-lg rounded-2xl bg-white p-6 shadow-xl border border-stone-200 my-8 animate-scale-in">
+            <h3 className="font-serif text-lg font-bold text-stone-900 mb-2">
+              Edit Decision Record
+            </h3>
+            {editingDecision.isAIGenerated && !editingDecision.confirmed && (
+              <p className="text-xs text-amber-800 bg-amber-50 border border-amber-200 rounded-xl p-2.5 mb-3">
+                Review and update the fields below. Saving will confirm this as your validated decision record.
+              </p>
+            )}
+            <form onSubmit={handleSaveDecisionEdits} className="space-y-4 text-xs">
+              <div>
+                <label className="font-semibold text-stone-700 block mb-1">
+                  Decision Title *
+                </label>
+                <input
+                  type="text"
+                  required
+                  value={editTitle}
+                  onChange={(e) => setEditTitle(e.target.value)}
+                  className="w-full rounded-xl border border-stone-300 p-2.5 text-xs text-stone-900 focus:outline-hidden"
+                />
+              </div>
+
+              <div>
+                <label className="font-semibold text-stone-700 block mb-1">
+                  Options Considered (one per line)
+                </label>
+                <textarea
+                  rows={3}
+                  value={editOptions.join('\n')}
+                  onChange={(e) => setEditOptions(e.target.value.split('\n'))}
+                  className="w-full rounded-xl border border-stone-300 p-2.5 text-xs text-stone-900 focus:outline-hidden"
+                />
+              </div>
+
+              <div>
+                <label className="font-semibold text-stone-700 block mb-1">
+                  Choice Made / Chosen Path
+                </label>
+                <input
+                  type="text"
+                  value={editChoice}
+                  onChange={(e) => setEditChoice(e.target.value)}
+                  className="w-full rounded-xl border border-stone-300 p-2.5 text-xs text-stone-900 focus:outline-hidden"
+                />
+              </div>
+
+              <div>
+                <label className="font-semibold text-stone-700 block mb-1">
+                  Reasoning & Mental Model
+                </label>
+                <textarea
+                  rows={2}
+                  value={editReasoning}
+                  onChange={(e) => setEditReasoning(e.target.value)}
+                  className="w-full rounded-xl border border-stone-300 p-2.5 text-xs text-stone-900 focus:outline-hidden"
+                />
+              </div>
+
+              <div>
+                <label className="font-semibold text-stone-700 block mb-1">
+                  Key Assumptions & Predictions (one per line)
+                </label>
+                <textarea
+                  rows={2}
+                  value={editAssumptions.join('\n')}
+                  onChange={(e) => setEditAssumptions(e.target.value.split('\n'))}
+                  className="w-full rounded-xl border border-stone-300 p-2.5 text-xs text-stone-900 focus:outline-hidden"
+                />
+              </div>
+
+              <div>
+                <div className="flex items-center justify-between mb-1">
+                  <label className="font-semibold text-stone-700">
+                    Confidence Level: {editConfidenceScore}%
+                  </label>
+                </div>
+                <input
+                  type="range"
+                  min="10"
+                  max="100"
+                  step="5"
+                  value={editConfidenceScore}
+                  onChange={(e) => setEditConfidenceScore(Number(e.target.value))}
+                  className="w-full accent-stone-900 cursor-pointer"
+                />
+              </div>
+
+              <div className="flex items-center justify-end gap-3 pt-3 border-t border-stone-100">
+                <button
+                  type="button"
+                  onClick={() => setEditingDecision(null)}
+                  className="rounded-xl px-4 py-2 text-stone-600 hover:bg-stone-100 font-medium"
+                >
+                  Cancel
+                </button>
+                <button
+                  type="submit"
+                  className="rounded-xl bg-stone-900 px-6 py-2 font-semibold text-white hover:bg-stone-800 shadow-xs"
+                >
+                  Save & Confirm Decision
                 </button>
               </div>
             </form>

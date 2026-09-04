@@ -113,7 +113,11 @@ export async function updateSessionTitle(uid: string, sessionId: string, newTitl
   }));
 }
 
-export async function deleteSession(uid: string, sessionId: string): Promise<void> {
+export async function deleteSession(uid: string, sessionId: string): Promise<{
+  deletedInsightCount: number;
+  deletedGoalCount: number;
+  deletedDecisionCount: number;
+}> {
   if (!uid || !sessionId) throw new Error('UID and Session ID are required to delete a session.');
   
   // 1. Delete all nested messages
@@ -125,7 +129,7 @@ export async function deleteSession(uid: string, sessionId: string): Promise<voi
   });
   await Promise.all(deletePromises);
 
-  // 2. Delete linked insights
+  // 2. Delete linked insights (derived consistency)
   const insightsCol = collection(db, 'users', uid, 'insights');
   const insightsQ = query(insightsCol, where('sessionId', '==', sessionId));
   const insightsSnap = await getDocs(insightsQ);
@@ -135,9 +139,35 @@ export async function deleteSession(uid: string, sessionId: string): Promise<voi
   });
   await Promise.all(insightDeletePromises);
 
-  // 3. Delete the session document itself
+  // 3. Delete linked goals (derived consistency)
+  const goalsCol = collection(db, 'users', uid, 'goals');
+  const goalsQ = query(goalsCol, where('sessionId', '==', sessionId));
+  const goalsSnap = await getDocs(goalsQ);
+  const goalDeletePromises: Promise<void>[] = [];
+  goalsSnap.forEach((gDoc) => {
+    goalDeletePromises.push(deleteDoc(gDoc.ref));
+  });
+  await Promise.all(goalDeletePromises);
+
+  // 4. Delete linked decisions (derived consistency)
+  const decisionsCol = collection(db, 'users', uid, 'decisions');
+  const decisionsQ = query(decisionsCol, where('sessionId', '==', sessionId));
+  const decisionsSnap = await getDocs(decisionsQ);
+  const decisionDeletePromises: Promise<void>[] = [];
+  decisionsSnap.forEach((dDoc) => {
+    decisionDeletePromises.push(deleteDoc(dDoc.ref));
+  });
+  await Promise.all(decisionDeletePromises);
+
+  // 5. Delete the session document itself
   const sessionDocRef = doc(db, 'users', uid, 'sessions', sessionId);
   await deleteDoc(sessionDocRef);
+
+  return {
+    deletedInsightCount: insightsSnap.size,
+    deletedGoalCount: goalsSnap.size,
+    deletedDecisionCount: decisionsSnap.size,
+  };
 }
 
 // ----------------------------------------------------------------------
@@ -307,6 +337,8 @@ export async function saveGoal(
     sessionTitle: goal.sessionTitle,
     targetDate: goal.targetDate,
     progressNotes: goal.progressNotes || '',
+    isAIGenerated: Boolean(goal.isAIGenerated),
+    confirmed: goal.confirmed !== undefined ? goal.confirmed : !goal.isAIGenerated,
     createdAt: now,
     updatedAt: now,
   };
@@ -334,6 +366,8 @@ export async function getGoals(uid: string): Promise<import('../types').GoalItem
       sessionTitle: data.sessionTitle,
       targetDate: data.targetDate,
       progressNotes: data.progressNotes || '',
+      isAIGenerated: Boolean(data.isAIGenerated),
+      confirmed: data.confirmed !== undefined ? Boolean(data.confirmed) : !data.isAIGenerated,
       createdAt: typeof data.createdAt === 'number' ? data.createdAt : Date.now(),
       updatedAt: typeof data.updatedAt === 'number' ? data.updatedAt : Date.now(),
     });
@@ -349,7 +383,8 @@ export async function updateGoalStatus(
 ): Promise<void> {
   if (!uid || !goalId) return;
   const goalRef = doc(db, 'users', uid, 'goals', goalId);
-  await updateDoc(goalRef, cleanPayload({ status, updatedAt: Date.now() }));
+  const confirmed = status !== 'suggested';
+  await updateDoc(goalRef, cleanPayload({ status, confirmed, updatedAt: Date.now() }));
 }
 
 export async function updateGoal(
@@ -377,6 +412,8 @@ export async function batchSaveGoals(
     status: import('../types').GoalStatus;
     sessionId?: string;
     sessionTitle?: string;
+    isAIGenerated?: boolean;
+    confirmed?: boolean;
   }>
 ): Promise<import('../types').GoalItem[]> {
   if (!uid || !Array.isArray(newGoals) || newGoals.length === 0) return [];
@@ -390,6 +427,8 @@ export async function batchSaveGoals(
       status: g.status,
       sessionId: g.sessionId,
       sessionTitle: g.sessionTitle,
+      isAIGenerated: g.isAIGenerated,
+      confirmed: g.confirmed,
     });
     saved.push(item);
   }
@@ -421,6 +460,8 @@ export async function saveDecision(
     sessionTitle: decision.sessionTitle,
     reviewDate: decision.reviewDate,
     reviewOutcome: decision.reviewOutcome,
+    isAIGenerated: Boolean(decision.isAIGenerated),
+    confirmed: decision.confirmed !== undefined ? decision.confirmed : !decision.isAIGenerated,
     createdAt: now,
     updatedAt: now,
   };
@@ -450,12 +491,51 @@ export async function getDecisions(uid: string): Promise<import('../types').Deci
       sessionTitle: data.sessionTitle,
       reviewDate: data.reviewDate,
       reviewOutcome: data.reviewOutcome,
+      isAIGenerated: Boolean(data.isAIGenerated),
+      confirmed: data.confirmed !== undefined ? Boolean(data.confirmed) : !data.isAIGenerated,
       createdAt: typeof data.createdAt === 'number' ? data.createdAt : Date.now(),
       updatedAt: typeof data.updatedAt === 'number' ? data.updatedAt : Date.now(),
     });
   });
 
   return decisions;
+}
+
+export async function batchSaveDecisions(
+  uid: string,
+  newDecisions: Array<{
+    title: string;
+    options: string[];
+    reasoning: string;
+    assumptions: string[];
+    choice: string;
+    confidenceScore?: number;
+    sessionId?: string;
+    sessionTitle?: string;
+    isAIGenerated?: boolean;
+    confirmed?: boolean;
+  }>
+): Promise<import('../types').DecisionItem[]> {
+  if (!uid || !Array.isArray(newDecisions) || newDecisions.length === 0) return [];
+  const saved: import('../types').DecisionItem[] = [];
+
+  for (const d of newDecisions) {
+    const item = await saveDecision(uid, {
+      title: d.title,
+      options: d.options,
+      reasoning: d.reasoning,
+      assumptions: d.assumptions,
+      choice: d.choice,
+      confidenceScore: d.confidenceScore,
+      sessionId: d.sessionId,
+      sessionTitle: d.sessionTitle,
+      isAIGenerated: d.isAIGenerated ?? true,
+      confirmed: d.confirmed ?? false,
+    });
+    saved.push(item);
+  }
+
+  return saved;
 }
 
 export async function updateDecision(

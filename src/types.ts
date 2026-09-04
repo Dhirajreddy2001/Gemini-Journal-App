@@ -29,7 +29,7 @@ export interface InsightItem {
   createdAt: number;
 }
 
-export type GoalStatus = 'active' | 'completed' | 'paused';
+export type GoalStatus = 'suggested' | 'active' | 'completed' | 'paused';
 
 export interface GoalItem {
   id: string;
@@ -41,6 +41,8 @@ export interface GoalItem {
   sessionTitle?: string;
   targetDate?: string;
   progressNotes?: string;
+  isAIGenerated?: boolean;
+  confirmed?: boolean;
   createdAt: number;
   updatedAt: number;
 }
@@ -75,6 +77,8 @@ export interface DecisionItem {
   sessionTitle?: string;
   reviewDate?: string;
   reviewOutcome?: DecisionReview;
+  isAIGenerated?: boolean;
+  confirmed?: boolean;
   createdAt: number;
   updatedAt: number;
 }

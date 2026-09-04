@@ -217,7 +217,25 @@ export const AskJournal: React.FC<AskJournalProps> = ({
                 </span>
               </div>
               <div className="text-sm text-stone-800 leading-relaxed space-y-3 font-normal">
-                <ReactMarkdown>{activeItem.answer}</ReactMarkdown>
+                <ReactMarkdown
+                  components={{
+                    a: ({ href, children }) => {
+                      const isSafe = href && /^(https?:|mailto:)/i.test(href);
+                      return (
+                        <a
+                          href={isSafe ? href : '#'}
+                          target="_blank"
+                          rel="noopener noreferrer"
+                          className="text-amber-800 underline hover:text-amber-950 font-medium"
+                        >
+                          {children}
+                        </a>
+                      );
+                    },
+                  }}
+                >
+                  {activeItem.answer}
+                </ReactMarkdown>
               </div>
             </div>
 
